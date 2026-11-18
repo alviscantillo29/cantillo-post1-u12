@@ -75,3 +75,47 @@ Siguiendo las recomendaciones conjuntas de [CISA, NSA y NIST (2023)](https://www
   2. *Hito 2 ($2026\text{–}2029$):* Transición obligatoria de navegadores, servidores web, VPN y equipos de red a suites PQC aprobadas (ML-KEM-1024 / ML-DSA-87).
   3. *Hito 3 ($2030\text{–}2033$):* Eliminación total de algoritmos clásicos vulnerables (RSA/ECC) y transición exclusiva a criptografía post-cuántica en toda la infraestructura.
 - **Riesgos y mitigaciones:** Dependencias de hardware criptográfico (HSM) sin soporte para retículos $\to$ planificar renovación temprana de HSM con actualización de firmware certificada FIPS 140-3 y uso de **SLH-DSA** en actualizaciones de arranque seguro (*Secure Boot*).
+
+---
+
+## 4. Comparación de Tamaños de Clave y Firma e Impacto en TLS 1.3
+
+La migración hacia criptografía post-cuántica sustituye claves y firmas de decenas de bytes por estructuras de varios kilobytes, como se detalla en la siguiente tabla comparativa (tamaños especificados en [FIPS 203](https://nvlpubs.nist.gov/nistpubs/fips/nist.fips.203.pdf), [FIPS 204](https://nvlpubs.nist.gov/nistpubs/fips/nist.fips.204.pdf) y [FIPS 205](https://nvlpubs.nist.gov/nistpubs/fips/nist.fips.205.pdf)):
+
+| Algoritmo | Tipo | Clave Pública (bytes) | Clave Privada (bytes) | Firma / Texto Cifrado (bytes) |
+| :--- | :--- | :---: | :---: | :---: |
+| **RSA-3072** | Clásico (Asimétrico) | $384$ | $\approx 1\,728$ | $384$ (firma) |
+| **ECDSA P-256** | Clásico (Firma ECC) | $64$ | $32$ | $64$ (firma) |
+| **X25519** | Clásico (ECDH) | $32$ | $32$ | $32$ (clave compartida) |
+| **ML-KEM-768** ([FIPS 203](https://nvlpubs.nist.gov/nistpubs/fips/nist.fips.203.pdf)) | PQC (KEM, Nivel 3) | $1\,184$ | $2\,400$ | $1\,088$ (texto cifrado) |
+| **ML-DSA-65** ([FIPS 204](https://nvlpubs.nist.gov/nistpubs/fips/nist.fips.204.pdf)) | PQC (Firma, Nivel 3) | $1\,952$ | $4\,032$ | $3\,309$ (firma) |
+| **SLH-DSA-128s** ([FIPS 205](https://nvlpubs.nist.gov/nistpubs/fips/nist.fips.205.pdf)) | PQC (Firma Hash, Nivel 1) | $32$ | $64$ | $7\,856$ (firma) |
+
+### Impacto en el *Handshake* de TLS 1.3 Híbrido (`X25519MLKEM768`)
+
+En una negociación estándar TLS 1.3 con `X25519`, el cliente envía una extensión `key_share` de apenas **$32\text{ bytes}$** dentro del mensaje `ClientHello`, y el servidor responde con otros **$32\text{ bytes}$**. Al habilitar el intercambio híbrido `X25519+ML-KEM-768`:
+- El `key_share` del cliente pasa de **$32\text{ bytes}$** a **$1\,216\text{ bytes}$** ($32\text{ B}$ de X25519 + $1\,184\text{ B}$ de la clave pública ML-KEM-768).
+- El `key_share` del servidor pasa de **$32\text{ bytes}$** a **$1\,120\text{ bytes}$** ($32\text{ B}$ de X25519 + $1\,088\text{ B}$ del texto cifrado ML-KEM-768).
+
+Desde el punto de vista de red, un `ClientHello` tradicional (~$250\text{–}500\text{ bytes}$) crece hasta aproximadamente $1\,500\text{–}1\,700\text{ bytes}$, superando el MTU típico de Ethernet ($1\,500\text{ bytes}$) y fragmentándose en **2 segmentos TCP**. Sin embargo, dado que la ventana inicial de congestión de TCP moderna es de **10 segmentos (`IW10`, $\approx 14\,600\text{ bytes}$)**, ambos segmentos se transmiten en el mismo vuelo inicial sin introducir *round trips* adicionales, manteniendo un impacto mínimo en la latencia percibida siempre que no existan *middleboxes* o cortafuegos antiguos que bloqueen `ClientHello` fragmentados.
+
+---
+
+## 5. Decisiones Técnicas — Parte 2
+
+### Decisión 1: Selección del algoritmo PQC del NIST para firma digital de recetas médicas (Perfil A)
+
+Para la firma digital de recetas médicas electrónicas del Perfil A (hospital universitario), se selecciona **ML-DSA-65** ([NIST FIPS 204](https://nvlpubs.nist.gov/nistpubs/fips/nist.fips.204.pdf)) y se descartan las otras dos familias por razones estructurales y operativas. En primer lugar, **ML-KEM** ([NIST FIPS 203](https://nvlpubs.nist.gov/nistpubs/fips/nist.fips.203.pdf)) queda descartado de plano porque es un mecanismo de encapsulación de claves (KEM) diseñado exclusivamente para intercambio de claves y confidencialidad, no para firmas digitales ni no repudio clínico. Entre las dos alternativas de firma, **ML-DSA-65** (nivel de seguridad 3) produce firmas de $3\,309\text{ bytes}$ y claves públicas de $1\,952\text{ bytes}$ con verificación y firma muy rápidas, frente a **SLH-DSA-128s** ([NIST FIPS 205](https://nvlpubs.nist.gov/nistpubs/fips/nist.fips.205.pdf)), cuyas firmas alcanzan $7\,856\text{ bytes}$ (más del doble) y presentan mayor latencia computacional en entornos de alto volumen transaccional hospitalario. Adicionalmente, conviene distinguir dos riesgos distintos: la confidencialidad del historial clínico está expuesta al ataque *Harvest Now, Decrypt Later* (HNDL) a $50\text{–}75$ años, mientras que la firma de la receta exige autenticidad al momento de la emisión y dispensación; no obstante, si las recetas archivadas deben mantener validez probatoria legal a largo plazo, la transición temprana a ML-DSA-65 evita la falsificación futura cuando existan computadores cuánticos criptográficamente relevantes.
+
+### Decisión 2: Permanencia vs. transitoriedad del modo híbrido en TLS para comercio electrónico (Perfil B)
+
+Para el Perfil B (startup de comercio electrónico), el modo híbrido (clásico + PQC, como `X25519+ML-KEM-768`) debe adoptarse como una **etapa de transición planificada** y no como una arquitectura permanente. En el corto y mediano plazo, el modo híbrido aporta una defensa en profundidad indispensable: protege simultáneamente frente a un eventual computador cuántico capaz de romper ECDH mediante el algoritmo de Shor y frente a posibles debilidades criptoanalíticas clásicas aún no descubiertas en los esquemas basados en retículos relativamente jóvenes como ML-KEM. Operativamente, su sobrecarga en TLS 1.3 es manejable: el incremento del campo `key_share` en `ClientHello` (de $\approx 32\text{ bytes}$ a $\approx 1\,216\text{ bytes}$) cabe dentro de la ventana inicial de congestión TCP (`IW10`) en la mayoría de conexiones web sin añadir viajes de ida y vuelta (*round trips*). Sin embargo, mantener ambos algoritmos de forma indefinida duplica la superficie de implementación, complica auditorías PCI-DSS y conserva dependencias de código legado que incrementan el costo de mantenimiento. Por ello, resulta técnicamente óptimo operar en modo híbrido durante la fase de convivencia y planificar el retiro de la criptografía clásica hacia PQC puro en concordancia con la maduración de los estándares y los plazos de referencia como CNSA 2.0 hacia $2033$.
+
+---
+
+## 6. Referencias (Formato APA)
+
+- Cybersecurity and Infrastructure Security Agency (CISA), National Security Agency (NSA), & National Institute of Standards and Technology (NIST). (2023, 21 de agosto). *Quantum-readiness: Migration to post-quantum cryptography*. Departamento de Seguridad Nacional de los Estados Unidos. https://www.cisa.gov/resources-tools/resources/quantum-readiness-migration-post-quantum-cryptography (PDF: https://media.defense.gov/2023/Aug/21/2003284212/-1/-1/0/CSI-QUANTUM-READINESS.PDF)
+- National Institute of Standards and Technology (NIST). (2024a). *Module-lattice-based key-encapsulation mechanism standard* (Federal Information Processing Standards Publication 203). Departamento de Comercio de los Estados Unidos. https://nvlpubs.nist.gov/nistpubs/fips/nist.fips.203.pdf (https://doi.org/10.6028/NIST.FIPS.203)
+- National Institute of Standards and Technology (NIST). (2024b). *Module-lattice-based digital signature standard* (Federal Information Processing Standards Publication 204). Departamento de Comercio de los Estados Unidos. https://nvlpubs.nist.gov/nistpubs/fips/nist.fips.204.pdf (https://doi.org/10.6028/NIST.FIPS.204)
+- National Institute of Standards and Technology (NIST). (2024c). *Stateless hash-based digital signature standard* (Federal Information Processing Standards Publication 205). Departamento de Comercio de los Estados Unidos. https://nvlpubs.nist.gov/nistpubs/fips/nist.fips.205.pdf (https://doi.org/10.6028/NIST.FIPS.205)
